@@ -4,6 +4,7 @@ import logging
 import re
 from datetime import datetime
 
+import httpx
 from telegram import LinkPreviewOptions, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 _HISTORY_FILE = DATA_DIR / "history.json"
 _URL_RE = re.compile(r"https?://\S+")
+_DISTANCE_RE = re.compile(r"Cách khoảng[:\s]*([0-9]+(?:[.,][0-9]+)?)\s*km", re.IGNORECASE)
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 
 def _get_meal_period() -> str:
@@ -34,6 +37,72 @@ def _get_meal_period() -> str:
         return "bữa tối"
     else:
         return "ăn khuya"
+
+
+def _extract_place_query(first_line: str) -> str | None:
+    parts = [p.strip() for p in first_line.split("|")]
+    if len(parts) < 2:
+        return None
+    # Expect: [Món] | [Quán + địa chỉ] | ...
+    return parts[1]
+
+
+def _extract_distance_km(first_line: str) -> float | None:
+    m = _DISTANCE_RE.search(first_line)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _choose_travel_mode(distance_km: float | None) -> str:
+    if distance_km is None:
+        return "walking"
+    return "walking" if distance_km <= 1.0 else "two-wheeler"
+
+
+async def _geocode_place(query: str) -> tuple[float, float] | None:
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "limit": 1,
+        "accept-language": "vi",
+        "countrycodes": "vn",
+    }
+    headers = {
+        "User-Agent": "hom-nay-an-gi-bot/1.0 (telegram bot)",
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(_NOMINATIM_URL, params=params, headers=headers)
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    if not data:
+        return None
+    try:
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    return lat, lon
+
+
+def _build_maps_url(
+    *,
+    origin_lat: float,
+    origin_lon: float,
+    dest_lat: float,
+    dest_lon: float,
+    travel_mode: str,
+) -> str:
+    return (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&origin={origin_lat},{origin_lon}"
+        f"&destination={dest_lat},{dest_lon}"
+        f"&travelmode={travel_mode}"
+    )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -70,12 +139,31 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             past_suggestions=past,
         )
 
+        # Normalize to 2-line output and replace destination with
+        # coordinates from OSM geocoding for higher route accuracy.
+        lines = [line.strip() for line in suggestion.splitlines() if line.strip()]
+        first_line = lines[0] if lines else suggestion.strip()
+        resolved_url = None
+        place_query = _extract_place_query(first_line)
+        if place_query:
+            distance_km = _extract_distance_km(first_line)
+            mode = _choose_travel_mode(distance_km)
+            dest = await _geocode_place(place_query)
+            if dest:
+                resolved_url = _build_maps_url(
+                    origin_lat=cfg.latitude,
+                    origin_lon=cfg.longitude,
+                    dest_lat=dest[0],
+                    dest_lon=dest[1],
+                    travel_mode=mode,
+                )
+
         # Try to force Telegram to render preview by sending URL
         # as a dedicated line with preview explicitly enabled.
         url_match = _URL_RE.search(suggestion)
         if url_match:
-            url = url_match.group(0)
-            text_without_url = suggestion.replace(url, "").strip()
+            url = resolved_url or url_match.group(0)
+            text_without_url = first_line
             if text_without_url:
                 await update.message.reply_text(text_without_url)
             await update.message.reply_text(
@@ -86,12 +174,19 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 ),
             )
         else:
+            fallback = suggestion.strip()
+            if resolved_url and first_line:
+                fallback = f"{first_line}\n{resolved_url}"
             await update.message.reply_text(
-                suggestion,
+                fallback,
                 link_preview_options=LinkPreviewOptions(is_disabled=False),
             )
 
-        save_entry(filepath=_HISTORY_FILE, meal=meal, suggestion=suggestion)
+        save_entry(
+            filepath=_HISTORY_FILE,
+            meal=meal,
+            suggestion=f"{first_line}\n{resolved_url or (url_match.group(0) if url_match else '')}".strip(),
+        )
 
     except Exception:
         logger.exception("Error in /eat command")
