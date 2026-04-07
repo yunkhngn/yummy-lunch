@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 import re
+import asyncio
 from datetime import datetime
 
 import httpx
 from telegram import LinkPreviewOptions, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import TimedOut
+from telegram.request import HTTPXRequest
 
 from src.config import DATA_DIR, Config, load_config
 from src.history import clear_history, get_past_suggestions, save_entry
@@ -105,8 +108,32 @@ def _build_maps_url(
     )
 
 
+async def _safe_reply(
+    update: Update,
+    text: str,
+    *,
+    link_preview_options: LinkPreviewOptions | None = None,
+    retries: int = 2,
+) -> None:
+    if not update.message:
+        return
+    for attempt in range(retries + 1):
+        try:
+            await update.message.reply_text(
+                text,
+                link_preview_options=link_preview_options,
+            )
+            return
+        except TimedOut:
+            if attempt >= retries:
+                logger.exception("Telegram reply timeout after retries")
+                return
+            await asyncio.sleep(1 + attempt)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    await _safe_reply(
+        update,
         "Hôm nay ăn gì?\n\n"
         "/eat — Gợi ý món ăn theo thời tiết\n"
         "/history — Xem đã gợi ý gì trong tuần\n"
@@ -118,7 +145,7 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.bot_data["config"]
     meal = _get_meal_period()
 
-    await update.message.reply_text(f"Đang tìm món ngon cho {meal}...")
+    await _safe_reply(update, "Đang tìm món ngon cho bữa trưa...")
 
     try:
         weather = await fetch_weather(
@@ -165,8 +192,9 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             url = resolved_url or url_match.group(0)
             text_without_url = first_line
             if text_without_url:
-                await update.message.reply_text(text_without_url)
-            await update.message.reply_text(
+                await _safe_reply(update, text_without_url)
+            await _safe_reply(
+                update,
                 url,
                 link_preview_options=LinkPreviewOptions(
                     is_disabled=False,
@@ -177,9 +205,12 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             fallback = suggestion.strip()
             if resolved_url and first_line:
                 fallback = f"{first_line}\n{resolved_url}"
-            await update.message.reply_text(
+            await _safe_reply(
+                update,
                 fallback,
-                link_preview_options=LinkPreviewOptions(is_disabled=False),
+                link_preview_options=LinkPreviewOptions(
+                    is_disabled=False
+                ),
             )
 
         save_entry(
@@ -190,24 +221,24 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     except Exception:
         logger.exception("Error in /eat command")
-        await update.message.reply_text(
-            "Có lỗi xảy ra. Vui lòng thử lại sau.",
-        )
+        await _safe_reply(update, "Có lỗi xảy ra. Vui lòng thử lại sau.")
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     past = get_past_suggestions(_HISTORY_FILE)
     if past:
-        await update.message.reply_text(f"Đã gợi ý trong tuần:\n\n{past}")
+        await _safe_reply(update, f"Đã gợi ý trong tuần:\n\n{past}")
     else:
-        await update.message.reply_text(
+        await _safe_reply(
+            update,
             "Chưa có gợi ý nào trong tuần này. Dùng /eat để bắt đầu.",
         )
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     clear_history(_HISTORY_FILE)
-    await update.message.reply_text(
+    await _safe_reply(
+        update,
         "Đã xóa lịch sử tuần. Dùng /eat để nhận gợi ý mới.",
     )
 
@@ -215,7 +246,13 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     cfg = load_config()
 
-    app = Application.builder().token(cfg.telegram_token).build()
+    request = HTTPXRequest(
+        connect_timeout=20.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    app = Application.builder().token(cfg.telegram_token).request(request).build()
     app.bot_data["config"] = cfg
 
     app.add_handler(CommandHandler("start", cmd_start))
