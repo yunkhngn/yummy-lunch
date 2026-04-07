@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 
-from telegram import Update
+from telegram import LinkPreviewOptions, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from src.config import DATA_DIR, Config, load_config
@@ -18,6 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _HISTORY_FILE = DATA_DIR / "history.json"
+_URL_RE = re.compile(r"https?://\S+")
 
 
 def _get_meal_period() -> str:
@@ -68,13 +70,26 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             past_suggestions=past,
         )
 
-        reply = suggestion
-
-        if len(reply) > 4096:
-            for i in range(0, len(reply), 4096):
-                await update.message.reply_text(reply[i : i + 4096])
+        # Try to force Telegram to render preview by sending URL
+        # as a dedicated line with preview explicitly enabled.
+        url_match = _URL_RE.search(suggestion)
+        if url_match:
+            url = url_match.group(0)
+            text_without_url = suggestion.replace(url, "").strip()
+            if text_without_url:
+                await update.message.reply_text(text_without_url)
+            await update.message.reply_text(
+                url,
+                link_preview_options=LinkPreviewOptions(
+                    is_disabled=False,
+                    url=url,
+                ),
+            )
         else:
-            await update.message.reply_text(reply)
+            await update.message.reply_text(
+                suggestion,
+                link_preview_options=LinkPreviewOptions(is_disabled=False),
+            )
 
         save_entry(filepath=_HISTORY_FILE, meal=meal, suggestion=suggestion)
 
