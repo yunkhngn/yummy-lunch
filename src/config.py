@@ -14,6 +14,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 class Config:
     telegram_token: str
     gemini_api_key: str
+    geoapify_api_key: str | None
     address: str
     latitude: float
     longitude: float
@@ -42,6 +43,7 @@ def load_config() -> Config:
     return Config(
         telegram_token=os.environ["TELEGRAM_BOT_TOKEN"],
         gemini_api_key=os.environ["GEMINI_API_KEY"],
+        geoapify_api_key=os.environ.get("GEOAPIFY_API_KEY") or None,
         address=os.environ["MY_ADDRESS"],
         latitude=float(os.environ["MY_LATITUDE"]),
         longitude=float(os.environ["MY_LONGITUDE"]),

@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import re
 import asyncio
+import math
 from datetime import datetime
+from urllib.parse import quote_plus
 
 import httpx
 from telegram import LinkPreviewOptions, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import TimedOut
+from telegram.error import RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
 from src.config import DATA_DIR, Config, load_config
@@ -26,6 +28,7 @@ _HISTORY_FILE = DATA_DIR / "history.json"
 _URL_RE = re.compile(r"https?://\S+")
 _DISTANCE_RE = re.compile(r"Cách khoảng[:\s]*([0-9]+(?:[.,][0-9]+)?)\s*km", re.IGNORECASE)
 _NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_GEOAPIFY_URL = "https://api.geoapify.com/v1/geocode/search"
 
 
 def _get_meal_period() -> str:
@@ -66,11 +69,89 @@ def _choose_travel_mode(distance_km: float | None) -> str:
     return "walking" if distance_km <= 1.0 else "two-wheeler"
 
 
-async def _geocode_place(query: str) -> tuple[float, float] | None:
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(d_lon / 2) ** 2
+    )
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+async def _geocode_place(
+    query: str,
+    *,
+    origin_lat: float,
+    origin_lon: float,
+    radius_km: int,
+    geoapify_api_key: str | None,
+) -> tuple[float, float] | None:
+    if geoapify_api_key:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Pass 1: strict search inside user radius
+            params1 = {
+                "text": query,
+                "filter": f"circle:{origin_lon},{origin_lat},{radius_km * 1000}",
+                "bias": f"proximity:{origin_lon},{origin_lat}",
+                "lang": "vi",
+                "limit": 5,
+                "apiKey": geoapify_api_key,
+            }
+            resp = await client.get(_GEOAPIFY_URL, params=params1)
+            if resp.status_code == 200:
+                data = resp.json().get("features", [])
+                best: tuple[float, float] | None = None
+                best_dist = float("inf")
+                for item in data:
+                    try:
+                        lon, lat = item["geometry"]["coordinates"]
+                        lat = float(lat)
+                        lon = float(lon)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    dist = _haversine_km(origin_lat, origin_lon, lat, lon)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = (lat, lon)
+                if best:
+                    return best
+
+            # Pass 2: broaden query and remove hard circle filter
+            params2 = {
+                "text": query,
+                "bias": f"proximity:{origin_lon},{origin_lat}",
+                "lang": "vi",
+                "limit": 10,
+                "apiKey": geoapify_api_key,
+            }
+            resp2 = await client.get(_GEOAPIFY_URL, params=params2)
+            if resp2.status_code == 200:
+                data2 = resp2.json().get("features", [])
+                best2: tuple[float, float] | None = None
+                best_dist2 = float("inf")
+                for item in data2:
+                    try:
+                        lon, lat = item["geometry"]["coordinates"]
+                        lat = float(lat)
+                        lon = float(lon)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    dist = _haversine_km(origin_lat, origin_lon, lat, lon)
+                    if dist < best_dist2:
+                        best_dist2 = dist
+                        best2 = (lat, lon)
+                if best2:
+                    return best2
+
+    # Fallback: Nominatim
     params = {
         "q": query,
         "format": "jsonv2",
-        "limit": 1,
+        "limit": 5,
         "accept-language": "vi",
         "countrycodes": "vn",
     }
@@ -84,12 +165,20 @@ async def _geocode_place(query: str) -> tuple[float, float] | None:
     data = resp.json()
     if not data:
         return None
-    try:
-        lat = float(data[0]["lat"])
-        lon = float(data[0]["lon"])
-    except (KeyError, ValueError, TypeError):
-        return None
-    return lat, lon
+
+    best: tuple[float, float] | None = None
+    best_dist = float("inf")
+    for item in data:
+        try:
+            lat = float(item["lat"])
+            lon = float(item["lon"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        dist = _haversine_km(origin_lat, origin_lon, lat, lon)
+        if dist < best_dist:
+            best_dist = dist
+            best = (lat, lon)
+    return best
 
 
 def _build_maps_url(
@@ -105,6 +194,39 @@ def _build_maps_url(
         f"&origin={origin_lat},{origin_lon}"
         f"&destination={dest_lat},{dest_lon}"
         f"&travelmode={travel_mode}"
+    )
+
+
+def _build_maps_url_text_destination(
+    *,
+    origin_lat: float,
+    origin_lon: float,
+    destination_text: str,
+    travel_mode: str,
+) -> str:
+    return (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&origin={origin_lat},{origin_lon}"
+        f"&destination={quote_plus(destination_text)}"
+        f"&travelmode={travel_mode}"
+    )
+
+
+def _build_geoapify_static_map_url(
+    *,
+    origin_lat: float,
+    origin_lon: float,
+    dest_lat: float,
+    dest_lon: float,
+    geoapify_api_key: str,
+) -> str:
+    return (
+        "https://maps.geoapify.com/v1/staticmap"
+        "?style=osm-bright"
+        "&width=900&height=450"
+        f"&marker=lonlat:{origin_lon},{origin_lat};color:%23007aff;size:small"
+        f"&marker=lonlat:{dest_lon},{dest_lat};color:%23ff3b30;size:large"
+        f"&apiKey={geoapify_api_key}"
     )
 
 
@@ -129,6 +251,44 @@ async def _safe_reply(
                 logger.exception("Telegram reply timeout after retries")
                 return
             await asyncio.sleep(1 + attempt)
+        except RetryAfter as e:
+            wait_seconds = int(getattr(e, "retry_after", 3))
+            if attempt >= retries:
+                logger.exception("Telegram flood control after retries")
+                return
+            await asyncio.sleep(wait_seconds + 1)
+        except Exception:
+            logger.exception("Telegram reply failed")
+            return
+
+
+async def _safe_photo(
+    update: Update,
+    photo_url: str,
+    *,
+    caption: str | None = None,
+    retries: int = 2,
+) -> None:
+    if not update.message:
+        return
+    for attempt in range(retries + 1):
+        try:
+            await update.message.reply_photo(photo=photo_url, caption=caption)
+            return
+        except TimedOut:
+            if attempt >= retries:
+                logger.exception("Telegram photo timeout after retries")
+                return
+            await asyncio.sleep(1 + attempt)
+        except RetryAfter as e:
+            wait_seconds = int(getattr(e, "retry_after", 3))
+            if attempt >= retries:
+                logger.exception("Telegram flood control on photo after retries")
+                return
+            await asyncio.sleep(wait_seconds + 1)
+        except Exception:
+            logger.exception("Telegram photo send failed")
+            return
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -171,43 +331,64 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines = [line.strip() for line in suggestion.splitlines() if line.strip()]
         first_line = lines[0] if lines else suggestion.strip()
         resolved_url = None
+        dest_coords: tuple[float, float] | None = None
         place_query = _extract_place_query(first_line)
+        distance_km = _extract_distance_km(first_line)
+        mode = _choose_travel_mode(distance_km)
+
+        # Safe fallback URL (always ASCII/URL-encoded) if geocoding fails.
         if place_query:
-            distance_km = _extract_distance_km(first_line)
-            mode = _choose_travel_mode(distance_km)
-            dest = await _geocode_place(place_query)
-            if dest:
-                resolved_url = _build_maps_url(
+            resolved_url = _build_maps_url_text_destination(
+                origin_lat=cfg.latitude,
+                origin_lon=cfg.longitude,
+                destination_text=place_query,
+                travel_mode=mode,
+            )
+
+        if place_query:
+            try:
+                dest = await _geocode_place(
+                    place_query,
                     origin_lat=cfg.latitude,
                     origin_lon=cfg.longitude,
-                    dest_lat=dest[0],
-                    dest_lon=dest[1],
-                    travel_mode=mode,
+                    radius_km=cfg.search_radius_km,
+                    geoapify_api_key=cfg.geoapify_api_key,
                 )
+                if dest:
+                    dest_coords = dest
+                    resolved_url = _build_maps_url(
+                        origin_lat=cfg.latitude,
+                        origin_lon=cfg.longitude,
+                        dest_lat=dest[0],
+                        dest_lon=dest[1],
+                        travel_mode=mode,
+                    )
+            except Exception:
+                logger.exception("Geocoding failed, falling back to text destination URL")
 
-        # Try to force Telegram to render preview by sending URL
-        # as a dedicated line with preview explicitly enabled.
+        # Send one single message to avoid Telegram flood control (429).
         url_match = _URL_RE.search(suggestion)
-        if url_match:
-            url = resolved_url or url_match.group(0)
-            text_without_url = first_line
-            if text_without_url:
-                await _safe_reply(update, text_without_url)
-            await _safe_reply(
-                update,
-                url,
-                link_preview_options=LinkPreviewOptions(
-                    is_disabled=False,
-                    url=url,
-                ),
+        url = resolved_url or (url_match.group(0) if url_match else "")
+        reply_text = first_line if first_line else suggestion.strip()
+        if url:
+            reply_text = f"{reply_text}\n{url}"
+        static_map_url = None
+        if cfg.geoapify_api_key and dest_coords:
+            static_map_url = _build_geoapify_static_map_url(
+                origin_lat=cfg.latitude,
+                origin_lon=cfg.longitude,
+                dest_lat=dest_coords[0],
+                dest_lon=dest_coords[1],
+                geoapify_api_key=cfg.geoapify_api_key,
             )
+
+        # Prefer sending static map image (stable visual preview).
+        if static_map_url:
+            await _safe_photo(update, static_map_url, caption=reply_text)
         else:
-            fallback = suggestion.strip()
-            if resolved_url and first_line:
-                fallback = f"{first_line}\n{resolved_url}"
             await _safe_reply(
                 update,
-                fallback,
+                reply_text,
                 link_preview_options=LinkPreviewOptions(
                     is_disabled=False
                 ),
@@ -216,7 +397,7 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         save_entry(
             filepath=_HISTORY_FILE,
             meal=meal,
-            suggestion=f"{first_line}\n{resolved_url or (url_match.group(0) if url_match else '')}".strip(),
+            suggestion=reply_text,
         )
 
     except Exception:
