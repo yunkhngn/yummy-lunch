@@ -36,7 +36,6 @@ async def main() -> None:
 
     print("Đang lấy thời tiết...")
     weather = await fetch_weather(
-        api_key=cfg.openweather_api_key,
         lat=cfg.latitude,
         lon=cfg.longitude,
     )

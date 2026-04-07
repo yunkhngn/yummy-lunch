@@ -45,22 +45,17 @@ QUAN TRỌNG: KHÔNG được gợi ý lại bất kỳ món ăn hoặc quán n�
 - Quán phải phù hợp cho nhóm 5–6 người, giá khoảng 50.000 VND/người (bình dân, quán ăn đường phố hoặc quán cơm bình dân)
 - Giải thích ngắn gọn tại sao món này hợp với thời tiết hôm nay (một câu)
 
-## Định dạng trả lời (BẮT BUỘC theo đúng định dạng này, KHÔNG emoji, KHÔNG markdown)
+## Định dạng trả lời (BẮT BUỘC theo đúng định dạng này, chỉ 2 dòng, KHÔNG emoji, KHÔNG markdown)
 
-Món: [tên món ăn]
-Quán: [tên quán] — [địa chỉ quán]
-Giá: khoảng [XX.000] đồng/người
-Cách khoảng: [X,X] km
-Lý do: [một câu ngắn giải thích tại sao hợp thời tiết]
-
-[liên kết Google Maps chỉ đường]
+Dòng 1: [Món] | [Quán + địa chỉ] | [Giá khoảng XX.000 đồng/người] | [Cách khoảng X,X km]
+Dòng 2: [liên kết Google Maps chỉ đường]
 
 Liên kết Google Maps dùng định dạng sau (KHÔNG ngắt dòng, một dòng duy nhất):
 https://www.google.com/maps/dir/?api=1&origin={maps_origin}&destination=TÊN+QUÁN+ĐỊA+CHỈ+QUÁN&travelmode=walking
 (thay TÊN+QUÁN+ĐỊA+CHỈ+QUÁN bằng tên và địa chỉ quán, dùng dấu + thay khoảng trắng)
 Nếu quán cách hơn 1 km thì dùng travelmode=two-wheeler thay cho walking (ưu tiên đi bộ khi gần).
 
-KHÔNG dùng emoji. KHÔNG dùng markdown. KHÔNG dùng dấu ** hay #. Chỉ văn bản thuần. Toàn bộ nội dung trả lời phải dùng tiếng Việt có dấu đầy đủ."""
+KHÔNG dùng emoji. KHÔNG dùng markdown. KHÔNG dùng dấu ** hay #. Chỉ văn bản thuần. Toàn bộ nội dung trả lời phải dùng tiếng Việt có dấu đầy đủ. Tuyệt đối không trả lời quá 2 dòng."""
 
 
 async def get_suggestion(

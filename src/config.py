@@ -14,7 +14,6 @@ DATA_DIR = PROJECT_ROOT / "data"
 class Config:
     telegram_token: str
     gemini_api_key: str
-    openweather_api_key: str
     address: str
     latitude: float
     longitude: float
@@ -24,7 +23,6 @@ class Config:
 _REQUIRED = [
     "TELEGRAM_BOT_TOKEN",
     "GEMINI_API_KEY",
-    "OPENWEATHER_API_KEY",
     "MY_ADDRESS",
     "MY_LATITUDE",
     "MY_LONGITUDE",
@@ -32,7 +30,7 @@ _REQUIRED = [
 
 
 def load_config() -> Config:
-    load_dotenv()
+    load_dotenv(override=False)
 
     missing = [k for k in _REQUIRED if not os.environ.get(k)]
     if missing:
@@ -44,7 +42,6 @@ def load_config() -> Config:
     return Config(
         telegram_token=os.environ["TELEGRAM_BOT_TOKEN"],
         gemini_api_key=os.environ["GEMINI_API_KEY"],
-        openweather_api_key=os.environ["OPENWEATHER_API_KEY"],
         address=os.environ["MY_ADDRESS"],
         latitude=float(os.environ["MY_LATITUDE"]),
         longitude=float(os.environ["MY_LONGITUDE"]),

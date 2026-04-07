@@ -51,7 +51,6 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         weather = await fetch_weather(
-            api_key=cfg.openweather_api_key,
             lat=cfg.latitude,
             lon=cfg.longitude,
         )
@@ -69,10 +68,7 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             past_suggestions=past,
         )
 
-        weather_line = (
-            f"{weather.city}: {weather.description}, {weather.temp_c}°C"
-        )
-        reply = f"{weather_line}\n\n{suggestion}"
+        reply = suggestion
 
         if len(reply) > 4096:
             for i in range(0, len(reply), 4096):
