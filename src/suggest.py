@@ -1,10 +1,59 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from google import genai
 
+from src.places import Place
 from src.weather import WeatherInfo
 
-_MODEL = "gemini-2.5-flash"
+_MODEL = "gemini-3.1-flash-lite-preview"
+
+
+@dataclass
+class SuggestionResult:
+    """Structured result from the suggestion engine."""
+
+    text: str
+    matched_place: Place | None = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers for grounding the prompt with real place data
+# ---------------------------------------------------------------------------
+
+
+def _format_places_list(places: list[Place]) -> str:
+    """Format a list of *Place* objects into a numbered prompt section."""
+    lines: list[str] = []
+    for i, p in enumerate(places, 1):
+        dist_km = p.distance_m / 1000
+        line = f"{i}. {p.name} — {p.address} (cách {dist_km:.1f} km)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def match_place(response_text: str, places: list[Place]) -> Place | None:
+    """Find which *Place* the AI chose by longest name-match in the response.
+
+    Returns ``None`` when no place from the list can be matched.
+    """
+    if not places:
+        return None
+    first_line = response_text.split("\n")[0].lower()
+    best: Place | None = None
+    best_len = 0
+    for place in places:
+        name_lower = place.name.lower()
+        if name_lower in first_line and len(name_lower) > best_len:
+            best = place
+            best_len = len(name_lower)
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
 
 
 def build_prompt(
@@ -16,6 +65,7 @@ def build_prompt(
     radius_km: int,
     meal_period: str,
     past_suggestions: str,
+    nearby_places: list[Place] | None = None,
 ) -> str:
     history_section = ""
     if past_suggestions:
@@ -25,6 +75,31 @@ def build_prompt(
 
 QUAN TRỌNG: KHÔNG được gợi ý lại bất kỳ món ăn hoặc quán nào đã xuất hiện ở trên. Hãy đề xuất món và quán hoàn toàn khác.
 """
+
+    # ---- grounding section: real places from Geoapify ---------------------
+    places_section = ""
+    if nearby_places:
+        places_list = _format_places_list(nearby_places)
+        places_section = f"""
+## Danh sách quán ăn thực tế gần đây (ĐÃ XÁC MINH TỒN TẠI)
+BẮT BUỘC chọn MỘT quán từ danh sách dưới đây. TUYỆT ĐỐI KHÔNG được bịa ra quán không có trong danh sách.
+Sử dụng ĐÚNG tên quán và địa chỉ như trong danh sách.
+
+{places_list}
+"""
+
+    # ---- constraint wording depends on whether we have real data ----------
+    if nearby_places:
+        constraint = (
+            "- BẮT BUỘC chọn quán từ danh sách đã cho ở trên. "
+            "Dùng đúng tên quán và địa chỉ trong danh sách. "
+            "KHÔNG tự bịa quán.\n"
+        )
+    else:
+        constraint = (
+            f"- Gợi ý một quán/hàng ăn cụ thể THỰC SỰ TỒN TẠI trong bán kính {radius_km} km "
+            "quanh địa chỉ trên (phải có tên quán và địa chỉ cụ thể, quán phải có trên Google Maps)\n"
+        )
 
     maps_origin = f"{latitude},{longitude}"
 
@@ -38,11 +113,10 @@ QUAN TRỌNG: KHÔNG được gợi ý lại bất kỳ món ăn hoặc quán n�
 - Số người: 5–6 người
 - Ngân sách: khoảng 50.000 VND/người
 - Bán kính tìm kiếm: {radius_km} km
-{history_section}
+{history_section}{places_section}
 ## Yêu cầu
 - Chỉ gợi ý đúng một món ăn duy nhất phù hợp với thời tiết hiện tại
-- Gợi ý một quán/hàng ăn cụ thể trong bán kính {radius_km} km quanh địa chỉ trên (phải có tên quán và địa chỉ cụ thể)
-- Quán phải phù hợp cho nhóm 5–6 người, giá khoảng 50.000 VND/người (bình dân, quán ăn đường phố hoặc quán cơm bình dân)
+{constraint}- Quán phải phù hợp cho nhóm 5–6 người, giá khoảng 50.000 VND/người (bình dân, quán ăn đường phố hoặc quán cơm bình dân)
 - Giải thích ngắn gọn tại sao món này hợp với thời tiết hôm nay (một câu)
 
 ## Định dạng trả lời (BẮT BUỘC theo đúng định dạng này, chỉ 2 dòng, KHÔNG emoji, KHÔNG markdown)
@@ -68,7 +142,8 @@ async def get_suggestion(
     radius_km: int,
     meal_period: str,
     past_suggestions: str,
-) -> str:
+    nearby_places: list[Place] | None = None,
+) -> SuggestionResult:
     prompt = build_prompt(
         weather=weather,
         address=address,
@@ -77,6 +152,7 @@ async def get_suggestion(
         radius_km=radius_km,
         meal_period=meal_period,
         past_suggestions=past_suggestions,
+        nearby_places=nearby_places,
     )
 
     client = genai.Client(api_key=api_key)
@@ -84,4 +160,7 @@ async def get_suggestion(
         model=_MODEL,
         contents=prompt,
     )
-    return response.text
+
+    text = response.text
+    matched = match_place(text, nearby_places or [])
+    return SuggestionResult(text=text, matched_place=matched)

@@ -4,8 +4,9 @@ import logging
 import re
 import asyncio
 import math
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import LinkPreviewOptions, Update
@@ -15,6 +16,8 @@ from telegram.request import HTTPXRequest
 
 from src.config import DATA_DIR, Config, load_config
 from src.history import clear_history, get_past_suggestions, save_entry
+from src.places import fetch_nearby_places
+from src.settings import get_chat_settings, load_settings, update_chat_settings
 from src.suggest import get_suggestion
 from src.weather import fetch_weather
 
@@ -25,7 +28,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _HISTORY_FILE = DATA_DIR / "history.json"
+_SETTINGS_FILE = DATA_DIR / "settings.json"
 _URL_RE = re.compile(r"https?://\S+")
+
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 _DISTANCE_RE = re.compile(r"Cách khoảng[:\s]*([0-9]+(?:[.,][0-9]+)?)\s*km", re.IGNORECASE)
 _NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 _GEOAPIFY_URL = "https://api.geoapify.com/v1/geocode/search"
@@ -297,15 +303,69 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Hôm nay ăn gì?\n\n"
         "/eat — Gợi ý món ăn theo thời tiết\n"
         "/history — Xem đã gợi ý gì trong tuần\n"
-        "/reset — Xóa lịch sử tuần",
+        "/reset — Xóa lịch sử tuần\n"
+        "/set_daily HH:MM — Hẹn giờ gợi ý mỗi ngày (VN)\n"
+        "/turn_on — Bật lại hẹn giờ\n"
+        "/turn_off — Tắt hẹn giờ",
     )
 
 
-async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _handle_suggestion_for_chat(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    update: Update | None = None,
+) -> None:
+    """Core logic shared by /eat and the daily scheduled job.
+
+    When *update* is provided the reply goes to the user who invoked /eat.
+    When *update* is ``None`` (scheduled job) a message is sent directly
+    to *chat_id*.
+    """
     cfg: Config = context.bot_data["config"]
     meal = _get_meal_period()
 
-    await _safe_reply(update, "Đang tìm món ngon cho bữa trưa...")
+    # -- helpers to abstract away "reply vs send" ----------------------------
+    async def _reply_text(
+        text: str,
+        link_preview_options: LinkPreviewOptions | None = None,
+    ) -> None:
+        if update:
+            await _safe_reply(update, text, link_preview_options=link_preview_options)
+        else:
+            for attempt in range(3):
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        link_preview_options=link_preview_options,
+                    )
+                    return
+                except (TimedOut, RetryAfter):
+                    await asyncio.sleep(2 + attempt)
+                except Exception:
+                    logger.exception("send_message failed for chat %s", chat_id)
+                    return
+
+    async def _reply_photo(photo_url: str, caption: str | None = None) -> None:
+        if update:
+            await _safe_photo(update, photo_url, caption=caption)
+        else:
+            for attempt in range(3):
+                try:
+                    await context.bot.send_photo(
+                        chat_id=chat_id, photo=photo_url, caption=caption
+                    )
+                    return
+                except (TimedOut, RetryAfter):
+                    await asyncio.sleep(2 + attempt)
+                except Exception:
+                    logger.exception("send_photo failed for chat %s", chat_id)
+                    return
+
+    # -----------------------------------------------------------------------
+
+    await _reply_text(f"Đang tìm món ngon cho {meal}...")
 
     try:
         weather = await fetch_weather(
@@ -315,7 +375,24 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         past = get_past_suggestions(_HISTORY_FILE)
 
-        suggestion = await get_suggestion(
+        # Fetch real nearby places to ground the AI suggestion
+        nearby_places = []
+        if cfg.geoapify_api_key:
+            try:
+                nearby_places = await fetch_nearby_places(
+                    api_key=cfg.geoapify_api_key,
+                    lat=cfg.latitude,
+                    lon=cfg.longitude,
+                    radius_km=cfg.search_radius_km,
+                )
+                logger.info(
+                    "Fetched %d real nearby places for grounding",
+                    len(nearby_places),
+                )
+            except Exception:
+                logger.exception("Failed to fetch nearby places, continuing without")
+
+        result = await get_suggestion(
             api_key=cfg.gemini_api_key,
             weather=weather,
             address=cfg.address,
@@ -324,49 +401,70 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             radius_km=cfg.search_radius_km,
             meal_period=meal,
             past_suggestions=past,
+            nearby_places=nearby_places,
         )
 
-        # Normalize to 2-line output and replace destination with
-        # coordinates from OSM geocoding for higher route accuracy.
+        suggestion = result.text
         lines = [line.strip() for line in suggestion.splitlines() if line.strip()]
         first_line = lines[0] if lines else suggestion.strip()
         resolved_url = None
         dest_coords: tuple[float, float] | None = None
-        place_query = _extract_place_query(first_line)
         distance_km = _extract_distance_km(first_line)
         mode = _choose_travel_mode(distance_km)
 
-        # Safe fallback URL (always ASCII/URL-encoded) if geocoding fails.
-        if place_query:
-            resolved_url = _build_maps_url_text_destination(
+        # Priority 1: Use matched real-place coordinates (most accurate)
+        if result.matched_place:
+            mp = result.matched_place
+            dest_coords = (mp.lat, mp.lon)
+            actual_dist = _haversine_km(
+                cfg.latitude, cfg.longitude, mp.lat, mp.lon
+            )
+            mode = _choose_travel_mode(actual_dist)
+            resolved_url = _build_maps_url(
                 origin_lat=cfg.latitude,
                 origin_lon=cfg.longitude,
-                destination_text=place_query,
+                dest_lat=mp.lat,
+                dest_lon=mp.lon,
                 travel_mode=mode,
             )
-
-        if place_query:
-            try:
-                dest = await _geocode_place(
-                    place_query,
+            logger.info(
+                "Matched real place: %s (%.6f, %.6f)",
+                mp.name,
+                mp.lat,
+                mp.lon,
+            )
+        else:
+            # Priority 2: Geocode the place name from the AI response
+            place_query = _extract_place_query(first_line)
+            if place_query:
+                resolved_url = _build_maps_url_text_destination(
                     origin_lat=cfg.latitude,
                     origin_lon=cfg.longitude,
-                    radius_km=cfg.search_radius_km,
-                    geoapify_api_key=cfg.geoapify_api_key,
+                    destination_text=place_query,
+                    travel_mode=mode,
                 )
-                if dest:
-                    dest_coords = dest
-                    resolved_url = _build_maps_url(
+                try:
+                    dest = await _geocode_place(
+                        place_query,
                         origin_lat=cfg.latitude,
                         origin_lon=cfg.longitude,
-                        dest_lat=dest[0],
-                        dest_lon=dest[1],
-                        travel_mode=mode,
+                        radius_km=cfg.search_radius_km,
+                        geoapify_api_key=cfg.geoapify_api_key,
                     )
-            except Exception:
-                logger.exception("Geocoding failed, falling back to text destination URL")
+                    if dest:
+                        dest_coords = dest
+                        resolved_url = _build_maps_url(
+                            origin_lat=cfg.latitude,
+                            origin_lon=cfg.longitude,
+                            dest_lat=dest[0],
+                            dest_lon=dest[1],
+                            travel_mode=mode,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Geocoding failed, falling back to text destination URL"
+                    )
 
-        # Send one single message to avoid Telegram flood control (429).
         url_match = _URL_RE.search(suggestion)
         url = resolved_url or (url_match.group(0) if url_match else "")
         reply_text = first_line if first_line else suggestion.strip()
@@ -382,16 +480,12 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 geoapify_api_key=cfg.geoapify_api_key,
             )
 
-        # Prefer sending static map image (stable visual preview).
         if static_map_url:
-            await _safe_photo(update, static_map_url, caption=reply_text)
+            await _reply_photo(static_map_url, caption=reply_text)
         else:
-            await _safe_reply(
-                update,
+            await _reply_text(
                 reply_text,
-                link_preview_options=LinkPreviewOptions(
-                    is_disabled=False
-                ),
+                link_preview_options=LinkPreviewOptions(is_disabled=False),
             )
 
         save_entry(
@@ -401,8 +495,16 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     except Exception:
-        logger.exception("Error in /eat command")
-        await _safe_reply(update, "Có lỗi xảy ra. Vui lòng thử lại sau.")
+        logger.exception("Error generating suggestion for chat %s", chat_id)
+        await _reply_text("Có lỗi xảy ra. Vui lòng thử lại sau.")
+
+
+async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_suggestion_for_chat(
+        chat_id=update.effective_chat.id,
+        context=context,
+        update=update,
+    )
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -424,6 +526,163 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Daily Scheduling: helpers
+# ---------------------------------------------------------------------------
+
+def _parse_time_str(raw: str) -> dt_time | None:
+    """Parse 'HH:MM' or 'HH' into a `datetime.time` (naive)."""
+    raw = raw.strip()
+    parts = raw.split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return dt_time(hour, minute)
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _job_name(chat_id: int | str) -> str:
+    return f"daily_{chat_id}"
+
+
+def _remove_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str) -> None:
+    """Remove existing daily job for *chat_id* (if any)."""
+    current_jobs = context.job_queue.get_jobs_by_name(_job_name(chat_id))
+    for job in current_jobs:
+        job.schedule_removal()
+
+
+def _schedule_daily_job(
+    context_or_app: ContextTypes.DEFAULT_TYPE | Application,
+    chat_id: int | str,
+    target_time: dt_time,
+) -> None:
+    """Register a daily job that fires at *target_time* (in VN_TZ)."""
+    jq = (
+        context_or_app.job_queue
+        if hasattr(context_or_app, "job_queue")
+        else context_or_app.job_queue
+    )
+    # Remove any existing job first
+    current_jobs = jq.get_jobs_by_name(_job_name(chat_id))
+    for job in current_jobs:
+        job.schedule_removal()
+
+    jq.run_daily(
+        _daily_job_callback,
+        time=target_time.replace(tzinfo=VN_TZ),
+        name=_job_name(chat_id),
+        chat_id=int(chat_id),
+        data={"chat_id": int(chat_id)},
+    )
+    logger.info(
+        "Scheduled daily job for chat %s at %s (VN)",
+        chat_id,
+        target_time.strftime("%H:%M"),
+    )
+
+
+async def _daily_job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback — sends a suggestion to the scheduled chat."""
+    chat_id = context.job.data["chat_id"]
+    logger.info("Running daily suggestion for chat %s", chat_id)
+    await _handle_suggestion_for_chat(chat_id=chat_id, context=context)
+
+
+def _restore_daily_jobs(app: Application) -> None:
+    """On startup, re-register daily jobs for every enabled chat."""
+    settings = load_settings(_SETTINGS_FILE)
+    for chat_id_str, cfg_entry in settings.items():
+        if not cfg_entry.get("enabled"):
+            continue
+        time_str = cfg_entry.get("time")
+        if not time_str:
+            continue
+        parsed = _parse_time_str(time_str)
+        if parsed is None:
+            logger.warning("Invalid time '%s' for chat %s, skipping.", time_str, chat_id_str)
+            continue
+        _schedule_daily_job(app, int(chat_id_str), parsed)
+
+
+# ---------------------------------------------------------------------------
+# Commands: /set_daily, /turn_on, /turn_off
+# ---------------------------------------------------------------------------
+
+async def cmd_set_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await _safe_reply(
+            update,
+            "Vui lòng nhập giờ hẹn. Ví dụ: /set_daily 11:30",
+        )
+        return
+
+    parsed = _parse_time_str(context.args[0])
+    if parsed is None:
+        await _safe_reply(
+            update,
+            "Định dạng giờ không hợp lệ. Dùng HH:MM hoặc HH.\nVí dụ: /set_daily 11:30",
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    time_str = parsed.strftime("%H:%M")
+    update_chat_settings(_SETTINGS_FILE, chat_id, time_str=time_str, enabled=True)
+    _remove_job(context, chat_id)
+    _schedule_daily_job(context, chat_id, parsed)
+
+    await _safe_reply(
+        update,
+        f"✅ Đã hẹn giờ gợi ý mỗi ngày lúc {time_str} (giờ Việt Nam).\n"
+        "Dùng /turn_off để tắt.",
+    )
+
+
+async def cmd_turn_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    chat_cfg = get_chat_settings(_SETTINGS_FILE, chat_id)
+    time_str = chat_cfg.get("time")
+
+    if not time_str:
+        await _safe_reply(
+            update,
+            "Bạn chưa hẹn giờ nào. Dùng /set_daily HH:MM để bắt đầu.",
+        )
+        return
+
+    parsed = _parse_time_str(time_str)
+    if parsed is None:
+        await _safe_reply(update, "Giờ hẹn lưu không hợp lệ. Vui lòng /set_daily lại.")
+        return
+
+    update_chat_settings(_SETTINGS_FILE, chat_id, enabled=True)
+    _remove_job(context, chat_id)
+    _schedule_daily_job(context, chat_id, parsed)
+
+    await _safe_reply(
+        update,
+        f"✅ Đã bật lại hẹn giờ lúc {time_str} (giờ Việt Nam).",
+    )
+
+
+async def cmd_turn_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    update_chat_settings(_SETTINGS_FILE, chat_id, enabled=False)
+    _remove_job(context, chat_id)
+
+    await _safe_reply(
+        update,
+        "⏸ Đã tắt hẹn giờ. Dùng /turn_on để bật lại.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     cfg = load_config()
 
@@ -440,6 +699,12 @@ def main() -> None:
     app.add_handler(CommandHandler("eat", cmd_eat))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("set_daily", cmd_set_daily))
+    app.add_handler(CommandHandler("turn_on", cmd_turn_on))
+    app.add_handler(CommandHandler("turn_off", cmd_turn_off))
+
+    # Restore persisted daily schedules.
+    _restore_daily_jobs(app)
 
     logger.info("Bot started polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

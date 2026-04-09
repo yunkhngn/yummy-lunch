@@ -5,6 +5,7 @@ from datetime import datetime
 
 from src.config import DATA_DIR, load_config
 from src.history import get_past_suggestions, save_entry
+from src.places import fetch_nearby_places
 from src.suggest import get_suggestion
 from src.weather import fetch_weather
 
@@ -45,8 +46,24 @@ async def main() -> None:
     if past:
         print(f"Đã gợi ý trong tuần:\n{past}\n")
 
+    # Fetch real nearby places for grounding
+    nearby_places = []
+    if cfg.geoapify_api_key:
+        print("Đang tìm quán ăn thật gần đây...")
+        nearby_places = await fetch_nearby_places(
+            api_key=cfg.geoapify_api_key,
+            lat=cfg.latitude,
+            lon=cfg.longitude,
+            radius_km=cfg.search_radius_km,
+        )
+        print(f"  Tìm thấy {len(nearby_places)} quán:")
+        for i, p in enumerate(nearby_places, 1):
+            dist_km = p.distance_m / 1000
+            print(f"    {i}. {p.name} — {p.address} ({dist_km:.1f} km)")
+        print()
+
     print("Đang hỏi Gemini...\n")
-    suggestion = await get_suggestion(
+    result = await get_suggestion(
         api_key=cfg.gemini_api_key,
         weather=weather,
         address=cfg.address,
@@ -55,10 +72,15 @@ async def main() -> None:
         radius_km=cfg.search_radius_km,
         meal_period=meal,
         past_suggestions=past,
+        nearby_places=nearby_places,
     )
-    print(suggestion)
+    print(result.text)
 
-    save_entry(filepath=_HISTORY_FILE, meal=meal, suggestion=suggestion)
+    if result.matched_place:
+        mp = result.matched_place
+        print(f"\n[Đã khớp quán thật: {mp.name} ({mp.lat:.6f}, {mp.lon:.6f})]")
+
+    save_entry(filepath=_HISTORY_FILE, meal=meal, suggestion=result.text)
     print("\nĐã lưu vào lịch sử tuần.")
 
 

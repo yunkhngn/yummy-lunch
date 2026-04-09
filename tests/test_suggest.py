@@ -113,6 +113,8 @@ class TestGetSuggestion:
             past_suggestions="",
         )
 
-        assert "Phở bò" in result
-        assert "Phở Hòa Pasteur" in result
+        assert "Phở bò" in result.text
+        assert "Phở Hòa Pasteur" in result.text
+        assert result.matched_place is None
         mock_client.aio.models.generate_content.assert_called_once()
+
