@@ -56,6 +56,12 @@ def match_place(response_text: str, places: list[Place]) -> Place | None:
 # ---------------------------------------------------------------------------
 
 
+_PLATFORM_NAMES = {
+    "shopeefood": "ShopeeFood",
+    "grabfood": "GrabFood",
+}
+
+
 def build_prompt(
     *,
     weather: WeatherInfo,
@@ -66,7 +72,11 @@ def build_prompt(
     meal_period: str,
     past_suggestions: str,
     nearby_places: list[Place] | None = None,
+    platform: str = "dine_in",
 ) -> str:
+    platform_name = _PLATFORM_NAMES.get(platform)
+    is_delivery = platform_name is not None
+
     history_section = ""
     if past_suggestions:
         history_section = f"""
@@ -98,10 +108,41 @@ Sử dụng ĐÚNG tên quán và địa chỉ như trong danh sách.
     else:
         constraint = (
             f"- Gợi ý một quán/hàng ăn cụ thể THỰC SỰ TỒN TẠI trong bán kính {radius_km} km "
-            "quanh địa chỉ trên (phải có tên quán và địa chỉ cụ thể, quán phải có trên Google Maps)\n"
+            "quanh địa chỉ trên (phải có tên quán và địa chỉ cụ thể)\n"
+        )
+
+    # ---- delivery-specific requirements -----------------------------------
+    delivery_extra = ""
+    if is_delivery:
+        delivery_extra = (
+            f"- Quán phải phổ biến và có khả năng cao có trên {platform_name} "
+            "(ưu tiên quán có giao hàng qua app)\n"
+            "- Món phải phù hợp để giao hàng (không bị nguội/hỏng khi ship)\n"
         )
 
     maps_origin = f"{latitude},{longitude}"
+
+    # ---- format section differs for dine-in vs delivery -------------------
+    if is_delivery:
+        format_section = f"""## Định dạng trả lời (BẮT BUỘC theo đúng định dạng này, chỉ 1 dòng, KHÔNG emoji, KHÔNG markdown)
+
+[Món] | [Quán + địa chỉ] | [Giá khoảng XX.000 đồng/người] | [Cách khoảng X,X km]
+
+KHÔNG thêm link. KHÔNG thêm dòng nào khác. Chỉ văn bản thuần.
+Toàn bộ nội dung trả lời phải dùng tiếng Việt có dấu đầy đủ. Tuyệt đối không trả lời quá 1 dòng."""
+    else:
+        format_section = f"""## Định dạng trả lời (BẮT BUỘC theo đúng định dạng này, chỉ 2 dòng, KHÔNG emoji, KHÔNG markdown)
+
+Dòng 1: [Món] | [Quán + địa chỉ] | [Giá khoảng XX.000 đồng/người] | [Cách khoảng X,X km]
+Dòng 2: [liên kết Google Maps chỉ đường]
+
+Liên kết Google Maps dùng định dạng sau (KHÔNG ngắt dòng, một dòng duy nhất):
+https://www.google.com/maps/dir/?api=1&origin={maps_origin}&destination=TÊN+QUÁN+ĐỊA+CHỈ+QUÁN&travelmode=walking
+(thay TÊN+QUÁN+ĐỊA+CHỈ+QUÁN bằng tên và địa chỉ quán, dùng dấu + thay khoảng trắng)
+Nếu quán cách hơn 1 km thì dùng travelmode=two-wheeler thay cho walking (ưu tiên đi bộ khi gần).
+
+KHÔNG dùng emoji. KHÔNG dùng markdown. KHÔNG dùng dấu ** hay #. Chỉ văn bản thuần.
+Toàn bộ nội dung trả lời phải dùng tiếng Việt có dấu đầy đủ. Tuyệt đối không trả lời quá 2 dòng."""
 
     return f"""Bạn là một chuyên gia ẩm thực địa phương tại Việt Nam. Hãy gợi ý cho tôi hôm nay ăn gì.
 
@@ -116,20 +157,10 @@ Sử dụng ĐÚNG tên quán và địa chỉ như trong danh sách.
 {history_section}{places_section}
 ## Yêu cầu
 - Chỉ gợi ý đúng một món ăn duy nhất phù hợp với thời tiết hiện tại
-{constraint}- Quán phải phù hợp cho nhóm 5–6 người, giá khoảng 50.000 VND/người (bình dân, quán ăn đường phố hoặc quán cơm bình dân)
+{constraint}{delivery_extra}- Quán phải phù hợp cho nhóm 5–6 người, giá khoảng 50.000 VND/người (bình dân, quán ăn đường phố hoặc quán cơm bình dân)
 - Giải thích ngắn gọn tại sao món này hợp với thời tiết hôm nay (một câu)
 
-## Định dạng trả lời (BẮT BUỘC theo đúng định dạng này, chỉ 2 dòng, KHÔNG emoji, KHÔNG markdown)
-
-Dòng 1: [Món] | [Quán + địa chỉ] | [Giá khoảng XX.000 đồng/người] | [Cách khoảng X,X km]
-Dòng 2: [liên kết Google Maps chỉ đường]
-
-Liên kết Google Maps dùng định dạng sau (KHÔNG ngắt dòng, một dòng duy nhất):
-https://www.google.com/maps/dir/?api=1&origin={maps_origin}&destination=TÊN+QUÁN+ĐỊA+CHỈ+QUÁN&travelmode=walking
-(thay TÊN+QUÁN+ĐỊA+CHỈ+QUÁN bằng tên và địa chỉ quán, dùng dấu + thay khoảng trắng)
-Nếu quán cách hơn 1 km thì dùng travelmode=two-wheeler thay cho walking (ưu tiên đi bộ khi gần).
-
-KHÔNG dùng emoji. KHÔNG dùng markdown. KHÔNG dùng dấu ** hay #. Chỉ văn bản thuần. Toàn bộ nội dung trả lời phải dùng tiếng Việt có dấu đầy đủ. Tuyệt đối không trả lời quá 2 dòng."""
+{format_section}"""
 
 
 async def get_suggestion(
@@ -143,6 +174,7 @@ async def get_suggestion(
     meal_period: str,
     past_suggestions: str,
     nearby_places: list[Place] | None = None,
+    platform: str = "dine_in",
 ) -> SuggestionResult:
     prompt = build_prompt(
         weather=weather,
@@ -153,6 +185,7 @@ async def get_suggestion(
         meal_period=meal_period,
         past_suggestions=past_suggestions,
         nearby_places=nearby_places,
+        platform=platform,
     )
 
     client = genai.Client(api_key=api_key)

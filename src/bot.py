@@ -302,12 +302,36 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update,
         "Hôm nay ăn gì?\n\n"
         "/eat — Gợi ý món ăn theo thời tiết\n"
+        "/eat_shopeefood — Gợi ý + link ShopeeFood\n"
+        "/eat_grabfood — Gợi ý + link GrabFood\n"
         "/history — Xem đã gợi ý gì trong tuần\n"
         "/reset — Xóa lịch sử tuần\n"
-        "/set_daily HH:MM — Hẹn giờ gợi ý mỗi ngày (VN)\n"
+        "/set_daily HH:MM — Hẹn giờ thông báo Daily meeting (VN)\n"
         "/turn_on — Bật lại hẹn giờ\n"
         "/turn_off — Tắt hẹn giờ",
     )
+
+
+import unicodedata
+
+_DELIVERY_PLATFORMS = {
+    "shopeefood": {"label": "ShopeeFood", "domain": "shopeefood.vn"},
+    "grabfood": {"label": "GrabFood", "domain": "food.grab.com"},
+}
+
+def _slugify(text: str) -> str:
+    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
+    text = re.sub(r'[^\w\s-]', '', text).strip().lower()
+    return re.sub(r'[-\s]+', '-', text)
+
+def _build_delivery_url(place_name: str, platform: str) -> str:
+    """Build a direct delivery URL or platform-specific search URL."""
+    if platform == "shopeefood":
+        slug = _slugify(place_name)
+        # Tạm thời default là ha-noi vì ShopeeFood bắt buộc có region.
+        return f"https://shopeefood.vn/ha-noi/{slug}"
+    # GrabFood có ID đặc thù phía sau URL quán nên dùng link search là chuẩn nhất.
+    return f"https://food.grab.com/vn/vi/restaurants?searchWord={quote_plus(place_name)}"
 
 
 async def _handle_suggestion_for_chat(
@@ -315,6 +339,7 @@ async def _handle_suggestion_for_chat(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     update: Update | None = None,
+    platform: str = "dine_in",
 ) -> None:
     """Core logic shared by /eat and the daily scheduled job.
 
@@ -324,6 +349,8 @@ async def _handle_suggestion_for_chat(
     """
     cfg: Config = context.bot_data["config"]
     meal = _get_meal_period()
+    is_delivery = platform in _DELIVERY_PLATFORMS
+    platform_label = _DELIVERY_PLATFORMS.get(platform, {}).get("label", "")
 
     # -- helpers to abstract away "reply vs send" ----------------------------
     async def _reply_text(
@@ -365,7 +392,10 @@ async def _handle_suggestion_for_chat(
 
     # -----------------------------------------------------------------------
 
-    await _reply_text(f"Đang tìm món ngon cho {meal}...")
+    if is_delivery:
+        await _reply_text(f"Đang tìm món ngon trên {platform_label} cho {meal}...")
+    else:
+        await _reply_text(f"Đang tìm món ngon cho {meal}...")
 
     try:
         weather = await fetch_weather(
@@ -375,6 +405,9 @@ async def _handle_suggestion_for_chat(
 
         past = get_past_suggestions(_HISTORY_FILE)
 
+        # Dine-in usually prefers walking distance, delivery can be further.
+        radius_km = 3 if is_delivery else cfg.search_radius_km
+
         # Fetch real nearby places to ground the AI suggestion
         nearby_places = []
         if cfg.geoapify_api_key:
@@ -383,11 +416,12 @@ async def _handle_suggestion_for_chat(
                     api_key=cfg.geoapify_api_key,
                     lat=cfg.latitude,
                     lon=cfg.longitude,
-                    radius_km=cfg.search_radius_km,
+                    radius_km=radius_km,
                 )
                 logger.info(
-                    "Fetched %d real nearby places for grounding",
+                    "Fetched %d real nearby places (radius=%dkm) for grounding",
                     len(nearby_places),
+                    radius_km,
                 )
             except Exception:
                 logger.exception("Failed to fetch nearby places, continuing without")
@@ -398,101 +432,136 @@ async def _handle_suggestion_for_chat(
             address=cfg.address,
             latitude=cfg.latitude,
             longitude=cfg.longitude,
-            radius_km=cfg.search_radius_km,
+            radius_km=radius_km,
             meal_period=meal,
             past_suggestions=past,
             nearby_places=nearby_places,
+            platform=platform,
         )
 
         suggestion = result.text
         lines = [line.strip() for line in suggestion.splitlines() if line.strip()]
         first_line = lines[0] if lines else suggestion.strip()
-        resolved_url = None
-        dest_coords: tuple[float, float] | None = None
-        distance_km = _extract_distance_km(first_line)
-        mode = _choose_travel_mode(distance_km)
 
-        # Priority 1: Use matched real-place coordinates (most accurate)
-        if result.matched_place:
-            mp = result.matched_place
-            dest_coords = (mp.lat, mp.lon)
-            actual_dist = _haversine_km(
-                cfg.latitude, cfg.longitude, mp.lat, mp.lon
-            )
-            mode = _choose_travel_mode(actual_dist)
-            resolved_url = _build_maps_url(
-                origin_lat=cfg.latitude,
-                origin_lon=cfg.longitude,
-                dest_lat=mp.lat,
-                dest_lon=mp.lon,
-                travel_mode=mode,
-            )
-            logger.info(
-                "Matched real place: %s (%.6f, %.6f)",
-                mp.name,
-                mp.lat,
-                mp.lon,
-            )
-        else:
-            # Priority 2: Geocode the place name from the AI response
-            place_query = _extract_place_query(first_line)
-            if place_query:
-                resolved_url = _build_maps_url_text_destination(
-                    origin_lat=cfg.latitude,
-                    origin_lon=cfg.longitude,
-                    destination_text=place_query,
-                    travel_mode=mode,
+        if is_delivery:
+            # --------------- Delivery platform mode -------------------------
+            if result.matched_place and result.matched_place.name:
+                search_target = result.matched_place.name
+            else:
+                place_query = _extract_place_query(first_line) or ""
+                # Tách lấy phần tên quán nếu chuỗi có chứa địa chỉ (thường phân cách bởi " - " hoặc " — ")
+                search_target = place_query.split(" - ")[0].split(" — ")[0].split("-")[0].strip()
+
+            reply_text = first_line
+            if search_target:
+                # Trực tiếp sinh URL ứng dụng giao hàng hoặc trang tìm kiếm nội bộ của họ
+                delivery_url = _build_delivery_url(
+                    search_target, platform
                 )
-                try:
-                    dest = await _geocode_place(
-                        place_query,
-                        origin_lat=cfg.latitude,
-                        origin_lon=cfg.longitude,
-                        radius_km=cfg.search_radius_km,
-                        geoapify_api_key=cfg.geoapify_api_key,
-                    )
-                    if dest:
-                        dest_coords = dest
-                        resolved_url = _build_maps_url(
-                            origin_lat=cfg.latitude,
-                            origin_lon=cfg.longitude,
-                            dest_lat=dest[0],
-                            dest_lon=dest[1],
-                            travel_mode=mode,
-                        )
-                except Exception:
-                    logger.exception(
-                        "Geocoding failed, falling back to text destination URL"
-                    )
+                reply_text = (
+                    f"{first_line}\n\n"
+                    f"Đặt trên {platform_label}:\n"
+                    f"{delivery_url}"
+                )
 
-        url_match = _URL_RE.search(suggestion)
-        url = resolved_url or (url_match.group(0) if url_match else "")
-        reply_text = first_line if first_line else suggestion.strip()
-        if url:
-            reply_text = f"{reply_text}\n{url}"
-        static_map_url = None
-        if cfg.geoapify_api_key and dest_coords:
-            static_map_url = _build_geoapify_static_map_url(
-                origin_lat=cfg.latitude,
-                origin_lon=cfg.longitude,
-                dest_lat=dest_coords[0],
-                dest_lon=dest_coords[1],
-                geoapify_api_key=cfg.geoapify_api_key,
-            )
-
-        if static_map_url:
-            await _reply_photo(static_map_url, caption=reply_text)
-        else:
             await _reply_text(
                 reply_text,
                 link_preview_options=LinkPreviewOptions(is_disabled=False),
             )
 
-        save_entry(
-            filepath=_HISTORY_FILE,
-            meal=meal,
-            suggestion=reply_text,
-        )
+            save_entry(
+                filepath=_HISTORY_FILE,
+                meal=meal,
+                suggestion=reply_text,
+            )
+        else:
+            # --------------- Dine-in mode (Google Maps) ---------------------
+            resolved_url = None
+            dest_coords: tuple[float, float] | None = None
+            distance_km = _extract_distance_km(first_line)
+            mode = _choose_travel_mode(distance_km)
+
+            # Priority 1: Use matched real-place coordinates (most accurate)
+            if result.matched_place:
+                mp = result.matched_place
+                dest_coords = (mp.lat, mp.lon)
+                actual_dist = _haversine_km(
+                    cfg.latitude, cfg.longitude, mp.lat, mp.lon
+                )
+                mode = _choose_travel_mode(actual_dist)
+                resolved_url = _build_maps_url(
+                    origin_lat=cfg.latitude,
+                    origin_lon=cfg.longitude,
+                    dest_lat=mp.lat,
+                    dest_lon=mp.lon,
+                    travel_mode=mode,
+                )
+                logger.info(
+                    "Matched real place: %s (%.6f, %.6f)",
+                    mp.name,
+                    mp.lat,
+                    mp.lon,
+                )
+            else:
+                # Priority 2: Geocode the place name from the AI response
+                place_query = _extract_place_query(first_line)
+                if place_query:
+                    resolved_url = _build_maps_url_text_destination(
+                        origin_lat=cfg.latitude,
+                        origin_lon=cfg.longitude,
+                        destination_text=place_query,
+                        travel_mode=mode,
+                    )
+                    try:
+                        dest = await _geocode_place(
+                            place_query,
+                            origin_lat=cfg.latitude,
+                            origin_lon=cfg.longitude,
+                            radius_km=cfg.search_radius_km,
+                            geoapify_api_key=cfg.geoapify_api_key,
+                        )
+                        if dest:
+                            dest_coords = dest
+                            resolved_url = _build_maps_url(
+                                origin_lat=cfg.latitude,
+                                origin_lon=cfg.longitude,
+                                dest_lat=dest[0],
+                                dest_lon=dest[1],
+                                travel_mode=mode,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Geocoding failed, falling back to text destination URL"
+                        )
+
+            url_match = _URL_RE.search(suggestion)
+            url = resolved_url or (url_match.group(0) if url_match else "")
+            reply_text = first_line if first_line else suggestion.strip()
+            if url:
+                reply_text = f"{reply_text}\n{url}"
+            static_map_url = None
+            if cfg.geoapify_api_key and dest_coords:
+                static_map_url = _build_geoapify_static_map_url(
+                    origin_lat=cfg.latitude,
+                    origin_lon=cfg.longitude,
+                    dest_lat=dest_coords[0],
+                    dest_lon=dest_coords[1],
+                    geoapify_api_key=cfg.geoapify_api_key,
+                )
+
+            if static_map_url:
+                await _reply_photo(static_map_url, caption=reply_text)
+            else:
+                await _reply_text(
+                    reply_text,
+                    link_preview_options=LinkPreviewOptions(is_disabled=False),
+                )
+
+            save_entry(
+                filepath=_HISTORY_FILE,
+                meal=meal,
+                suggestion=reply_text,
+            )
 
     except Exception:
         logger.exception("Error generating suggestion for chat %s", chat_id)
@@ -504,6 +573,24 @@ async def cmd_eat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=update.effective_chat.id,
         context=context,
         update=update,
+    )
+
+
+async def cmd_eat_shopeefood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_suggestion_for_chat(
+        chat_id=update.effective_chat.id,
+        context=context,
+        update=update,
+        platform="shopeefood",
+    )
+
+
+async def cmd_eat_grabfood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_suggestion_for_chat(
+        chat_id=update.effective_chat.id,
+        context=context,
+        update=update,
+        platform="grabfood",
     )
 
 
@@ -586,10 +673,24 @@ def _schedule_daily_job(
 
 
 async def _daily_job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue callback — sends a suggestion to the scheduled chat."""
+    """JobQueue callback — sends a meeting announcement to the scheduled chat."""
     chat_id = context.job.data["chat_id"]
-    logger.info("Running daily suggestion for chat %s", chat_id)
-    await _handle_suggestion_for_chat(chat_id=chat_id, context=context)
+    logger.info("Running daily meeting announcement for chat %s", chat_id)
+    
+    chat_cfg = get_chat_settings(_SETTINGS_FILE, chat_id)
+    time_str = chat_cfg.get("time", "")
+    
+    parsed = _parse_time_str(time_str)
+    if parsed:
+        am_pm_time = parsed.strftime("%I:%M %p")
+    else:
+        am_pm_time = time_str
+
+    text = f"Daily meeting start at {am_pm_time}, please join the meeting"
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        logger.exception("send_message failed for chat %s", chat_id)
 
 
 def _restore_daily_jobs(app: Application) -> None:
@@ -636,7 +737,7 @@ async def cmd_set_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await _safe_reply(
         update,
-        f"✅ Đã hẹn giờ gợi ý mỗi ngày lúc {time_str} (giờ Việt Nam).\n"
+        f"✅ Đã hẹn giờ thông báo Daily meeting mỗi ngày lúc {time_str} (giờ Việt Nam).\n"
         "Dùng /turn_off để tắt.",
     )
 
@@ -697,6 +798,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("eat", cmd_eat))
+    app.add_handler(CommandHandler("eat_shopeefood", cmd_eat_shopeefood))
+    app.add_handler(CommandHandler("eat_grabfood", cmd_eat_grabfood))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("set_daily", cmd_set_daily))
