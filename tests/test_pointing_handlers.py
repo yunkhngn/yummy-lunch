@@ -115,3 +115,65 @@ class TestCmdCancelRoom:
         await cmd_cancel_room(update, context)
 
         assert room.room_id in store
+
+
+class TestCmdStartPoint:
+    @pytest.mark.asyncio
+    async def test_start_point_sends_dm_to_participants(self):
+        from src.pointing_handlers import cmd_start_point
+        from src.pointing import create_room, join_room
+
+        context = _make_context()
+        store = context.bot_data["pointing_rooms"]
+        room = create_room(store, host_id=111, chat_id=999, topic_id=1)
+        join_room(room, user_id=222)
+        join_room(room, user_id=333)
+
+        update = _make_update(user_id=111, chat_id=999)
+
+        await cmd_start_point(update, context)
+
+        assert context.bot.send_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_host_cannot_start(self):
+        from src.pointing_handlers import cmd_start_point
+        from src.pointing import create_room, join_room
+
+        context = _make_context()
+        store = context.bot_data["pointing_rooms"]
+        room = create_room(store, host_id=111, chat_id=999, topic_id=1)
+        join_room(room, user_id=222)
+
+        update = _make_update(user_id=222, chat_id=999)
+
+        await cmd_start_point(update, context)
+
+        assert context.bot.send_message.call_count == 0
+
+
+class TestVoteCallback:
+    @pytest.mark.asyncio
+    async def test_vote_records_and_acks(self):
+        from src.pointing_handlers import handle_vote_callback
+        from src.pointing import create_room, join_room
+
+        context = _make_context()
+        store = context.bot_data["pointing_rooms"]
+        room = create_room(store, host_id=111, chat_id=999, topic_id=1)
+        join_room(room, user_id=222)
+
+        query = MagicMock()
+        query.from_user.id = 222
+        query.from_user.first_name = "Alice"
+        query.data = f"vote:{room.room_id}:5"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        await handle_vote_callback(update, context)
+
+        query.answer.assert_called_once()
+        assert room.votes[222] == 5
