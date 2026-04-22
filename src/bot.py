@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from telegram import LinkPreviewOptions, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from telegram.error import RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
@@ -20,6 +20,16 @@ from src.places import fetch_nearby_places
 from src.settings import get_chat_settings, load_settings, update_chat_settings
 from src.suggest import get_suggestion
 from src.weather import fetch_weather
+from src.pointing_handlers import (
+    ROOM_STORE_KEY,
+    _cleanup_job_callback,
+    cmd_cancel_room,
+    cmd_create_room,
+    cmd_join_room,
+    cmd_reveal,
+    cmd_start_point,
+    handle_vote_callback,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -308,7 +318,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset — Xóa lịch sử tuần\n"
         "/set_daily HH:MM — Hẹn giờ thông báo Daily meeting (VN)\n"
         "/turn_on — Bật lại hẹn giờ\n"
-        "/turn_off — Tắt hẹn giờ",
+        "/turn_off — Tắt hẹn giờ\n\n"
+        "Sprint Pointing:\n"
+        "/create_room — Tạo room đánh điểm\n"
+        "/join_room <id> — Join room\n"
+        "/start_point — Bắt đầu đánh điểm\n"
+        "/reveal — Reveal kết quả\n"
+        "/cancel_room — Huỷ room",
     )
 
 
@@ -637,6 +653,8 @@ def _job_name(chat_id: int | str) -> str:
 
 def _remove_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str) -> None:
     """Remove existing daily job for *chat_id* (if any)."""
+    if context.job_queue is None:
+        return
     current_jobs = context.job_queue.get_jobs_by_name(_job_name(chat_id))
     for job in current_jobs:
         job.schedule_removal()
@@ -648,11 +666,10 @@ def _schedule_daily_job(
     target_time: dt_time,
 ) -> None:
     """Register a daily job that fires at *target_time* (in VN_TZ)."""
-    jq = (
-        context_or_app.job_queue
-        if hasattr(context_or_app, "job_queue")
-        else context_or_app.job_queue
-    )
+    jq = context_or_app.job_queue
+    if jq is None:
+        logger.warning("JobQueue unavailable; cannot schedule daily job for chat %s.", chat_id)
+        return
     # Remove any existing job first
     current_jobs = jq.get_jobs_by_name(_job_name(chat_id))
     for job in current_jobs:
@@ -805,6 +822,22 @@ def main() -> None:
     app.add_handler(CommandHandler("set_daily", cmd_set_daily))
     app.add_handler(CommandHandler("turn_on", cmd_turn_on))
     app.add_handler(CommandHandler("turn_off", cmd_turn_off))
+    app.add_handler(CommandHandler("create_room", cmd_create_room))
+    app.add_handler(CommandHandler("join_room", cmd_join_room))
+    app.add_handler(CommandHandler("start_point", cmd_start_point))
+    app.add_handler(CommandHandler("reveal", cmd_reveal))
+    app.add_handler(CommandHandler("cancel_room", cmd_cancel_room))
+    app.add_handler(CallbackQueryHandler(handle_vote_callback, pattern=r"^vote:"))
+    app.bot_data[ROOM_STORE_KEY] = {}
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            _cleanup_job_callback,
+            interval=30,
+            first=30,
+            name="pointing_cleanup",
+        )
+    else:
+        logger.warning("JobQueue unavailable; pointing cleanup job is disabled.")
 
     # Restore persisted daily schedules.
     _restore_daily_jobs(app)
