@@ -88,3 +88,16 @@ def format_results(room: PointingRoom, names: dict[int, str]) -> str:
         lines.append("")
         lines.append(f"Average: {avg:.1f}")
     return "\n".join(lines)
+
+
+def cleanup_expired_rooms(
+    store: dict[str, PointingRoom],
+    max_idle_seconds: int = 60,
+) -> list[PointingRoom]:
+    now = time.time()
+    expired = [
+        room for room in store.values() if (now - room.last_activity) > max_idle_seconds
+    ]
+    for room in expired:
+        store.pop(room.room_id, None)
+    return expired

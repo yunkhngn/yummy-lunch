@@ -1,6 +1,9 @@
+import time
+
 from src.pointing import (
     POINT_OPTIONS,
     PointingRoom,
+    cleanup_expired_rooms,
     create_room,
     format_results,
     get_room,
@@ -116,3 +119,21 @@ class TestFormatResults:
         assert "Alice" in result
         assert "Bob" in result
         assert "chưa vote" in result.lower() or "—" in result
+
+
+class TestCleanupExpiredRooms:
+    def test_removes_expired_rooms(self):
+        store = {}
+        room = create_room(store, host_id=111, chat_id=999, topic_id=1)
+        room.last_activity = time.time() - 120
+        removed = cleanup_expired_rooms(store, max_idle_seconds=60)
+        assert room.room_id not in store
+        assert len(removed) == 1
+
+    def test_keeps_active_rooms(self):
+        store = {}
+        room = create_room(store, host_id=111, chat_id=999, topic_id=1)
+        room.last_activity = time.time()
+        removed = cleanup_expired_rooms(store, max_idle_seconds=60)
+        assert room.room_id in store
+        assert len(removed) == 0
