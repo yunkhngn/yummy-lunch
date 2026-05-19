@@ -81,6 +81,16 @@ Yêu cầu:
 - Chỉ văn bản thuần"""
 
 
+async def get_thank_you_message(*, api_key: str, boss_name: str) -> str:
+    prompt = build_thank_you_prompt(boss_name)
+    client = genai.Client(api_key=api_key)
+    response = await client.aio.models.generate_content(
+        model=_MODEL,
+        contents=prompt,
+    )
+    return response.text or ""
+
+
 def build_prompt(
     *,
     weather: WeatherInfo,
@@ -213,6 +223,6 @@ async def get_suggestion(
         contents=prompt,
     )
 
-    text = response.text
+    text = response.text or ""
     matched = match_place(text, nearby_places or [])
     return SuggestionResult(text=text, matched_place=matched)

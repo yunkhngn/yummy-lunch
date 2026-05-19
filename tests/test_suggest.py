@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.suggest import build_prompt, build_thank_you_prompt, get_suggestion
+from src.suggest import build_prompt, build_thank_you_prompt, get_suggestion, get_thank_you_message
 from src.weather import WeatherInfo
 
 
@@ -22,6 +22,73 @@ class TestBuildThankYouPrompt:
     def test_vietnamese_instruction(self):
         prompt = build_thank_you_prompt("Anh Tuấn")
         assert "tiếng Việt có dấu" in prompt
+
+
+class TestGetThankYouMessage:
+    @pytest.mark.asyncio
+    @patch("src.suggest.genai")
+    async def test_calls_gemini_and_returns_text(self, mock_genai):
+        mock_response = MagicMock()
+        mock_response.text = (
+            "Kính gửi Anh Nam,\n\n"
+            "Đoạn 1 cảm ơn.\n\n"
+            "Đoạn 2 ca ngợi.\n\n"
+            "Đoạn 3 lời chúc."
+        )
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=mock_response
+        )
+        mock_genai.Client.return_value = mock_client
+
+        result = await get_thank_you_message(api_key="fake-key", boss_name="Anh Nam")
+
+        assert "Anh Nam" in result
+        assert "Đoạn 1" in result
+        mock_client.aio.models.generate_content.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("src.suggest.genai")
+    async def test_passes_boss_name_to_prompt(self, mock_genai):
+        mock_response = MagicMock()
+        mock_response.text = "Cảm ơn Chị Lan."
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(
+            return_value=mock_response
+        )
+        mock_genai.Client.return_value = mock_client
+
+        await get_thank_you_message(api_key="fake-key", boss_name="Chị Lan")
+
+        call_args = mock_client.aio.models.generate_content.call_args
+        contents = call_args.kwargs.get("contents", "")
+        assert "Chị Lan" in contents
+
+    @pytest.mark.asyncio
+    @patch("src.suggest.genai")
+    async def test_forwards_api_key_to_client(self, mock_genai):
+        mock_response = MagicMock()
+        mock_response.text = "ok"
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+        mock_genai.Client.return_value = mock_client
+
+        await get_thank_you_message(api_key="my-secret-key", boss_name="Sếp")
+
+        mock_genai.Client.assert_called_once_with(api_key="my-secret-key")
+
+    @pytest.mark.asyncio
+    @patch("src.suggest.genai")
+    async def test_returns_empty_string_when_response_text_is_none(self, mock_genai):
+        mock_response = MagicMock()
+        mock_response.text = None
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+        mock_genai.Client.return_value = mock_client
+
+        result = await get_thank_you_message(api_key="fake-key", boss_name="Sếp")
+
+        assert result == ""
 
 
 def _sample_weather() -> WeatherInfo:
