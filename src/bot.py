@@ -18,7 +18,7 @@ from src.config import DATA_DIR, Config, load_config
 from src.history import clear_history, get_past_suggestions, save_entry
 from src.places import fetch_nearby_places
 from src.settings import get_chat_settings, load_settings, update_chat_settings
-from src.suggest import get_suggestion
+from src.suggest import get_suggestion, get_thank_you_message
 from src.weather import fetch_weather
 from src.pointing_handlers import (
     ROOM_STORE_KEY,
@@ -324,7 +324,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/join_room <id> — Join room\n"
         "/start_point — Bắt đầu đánh điểm\n"
         "/reveal — Reveal kết quả\n"
-        "/cancel_room — Huỷ room",
+        "/cancel_room — Huỷ room\n\n"
+        "Cảm ơn:\n"
+        "/thank_you <tên> — Cảm ơn sếp đã đặt đồ ăn",
     )
 
 
@@ -797,6 +799,30 @@ async def cmd_turn_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def cmd_thank_you(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await _safe_reply(
+            update,
+            "Vui lòng nhập tên sếp. Ví dụ: /thank_you Anh Nam",
+        )
+        return
+
+    boss_name = " ".join(context.args)
+    cfg: Config = context.bot_data["config"]
+
+    await _safe_reply(update, f"Đang soạn lời cảm ơn gửi {boss_name}...")
+
+    try:
+        message = await get_thank_you_message(
+            api_key=cfg.gemini_api_key,
+            boss_name=boss_name,
+        )
+        await _safe_reply(update, message or "Có lỗi xảy ra. Vui lòng thử lại sau.")
+    except Exception:
+        logger.exception("Error generating thank-you message")
+        await _safe_reply(update, "Có lỗi xảy ra. Vui lòng thử lại sau.")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -827,6 +853,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start_point", cmd_start_point))
     app.add_handler(CommandHandler("reveal", cmd_reveal))
     app.add_handler(CommandHandler("cancel_room", cmd_cancel_room))
+    app.add_handler(CommandHandler("thank_you", cmd_thank_you))
     app.add_handler(CallbackQueryHandler(handle_vote_callback, pattern=r"^vote:"))
     app.bot_data[ROOM_STORE_KEY] = {}
     if app.job_queue is not None:
