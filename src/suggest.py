@@ -62,6 +62,25 @@ _PLATFORM_NAMES = {
 }
 
 
+def build_thank_you_prompt(boss_name: str) -> str:
+    return f"""Bạn là một nhân viên văn phòng người Việt Nam.
+Sếp của bạn tên là {boss_name} vừa đặt đồ ăn cho cả nhóm.
+Hãy viết một lời cảm ơn chân thành gửi đến {boss_name}.
+
+Yêu cầu:
+- Viết đúng 3 đoạn văn, mỗi đoạn cách nhau một dòng trống
+- Đoạn 1: Bày tỏ sự biết ơn chân thành vì {boss_name} đã quan tâm đặt đồ ăn cho cả nhóm
+- Đoạn 2: Ca ngợi sự chu đáo và tâm lý của {boss_name} một cách tự nhiên, không quá mức
+- Đoạn 3: Lời chúc nhẹ nhàng và cam kết làm việc tốt hơn
+- Giọng văn: lịch sự, ấm áp, tự nhiên — như nhân viên thân thiết nói chuyện với sếp, có thể có 1-2 câu duyên dáng nhẹ nhàng
+- Xưng hô phù hợp, dùng đúng tên {boss_name}
+- Mỗi đoạn dài 3-5 câu
+- Toàn bộ bằng tiếng Việt có dấu đầy đủ
+- KHÔNG dùng emoji
+- KHÔNG dùng markdown, KHÔNG dùng dấu ** hay #
+- Chỉ văn bản thuần"""
+
+
 def build_prompt(
     *,
     weather: WeatherInfo,

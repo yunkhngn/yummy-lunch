@@ -2,8 +2,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.suggest import build_prompt, get_suggestion
+from src.suggest import build_prompt, build_thank_you_prompt, get_suggestion
 from src.weather import WeatherInfo
+
+
+class TestBuildThankYouPrompt:
+    def test_contains_boss_name(self):
+        prompt = build_thank_you_prompt("Anh Nam")
+        assert "Anh Nam" in prompt
+
+    def test_requests_three_paragraphs(self):
+        prompt = build_thank_you_prompt("Chị Lan")
+        assert "3 đoạn văn" in prompt
+
+    def test_no_emoji_instruction(self):
+        prompt = build_thank_you_prompt("Sếp")
+        assert "KHÔNG dùng emoji" in prompt
+
+    def test_vietnamese_instruction(self):
+        prompt = build_thank_you_prompt("Anh Tuấn")
+        assert "tiếng Việt có dấu" in prompt
 
 
 def _sample_weather() -> WeatherInfo:
